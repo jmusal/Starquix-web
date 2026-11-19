@@ -56,6 +56,19 @@ Publish to Cloudflare or GitHub Pages, to Netlify or Vercel through your GitHub 
   </tr>
 </table>
 
+## Run in the browser
+
+Starquix also runs as a local web app: a Node server replaces the desktop app, and the editor opens in any browser. It needs Node.js 22+ and works on macOS and Linux.
+
+```bash
+npm ci
+npm ci --prefix preview-template
+npm run web:build
+npm run web          # open the printed link (it ends with ?token=…)
+```
+
+How it works, options, security and limits: [docs/web.md](docs/web.md).
+
 ## Development
 
 ```bash
@@ -75,12 +88,13 @@ cd desktop && npm run deps && npm start      # desktop app
 
 Requires Node.js 22+ and npm 10. The desktop app runs on macOS.
 
-Tests: `cd app && npm run test:run` and `cd desktop && npm test`.
+Tests: `cd app && npm run test:run`, `cd desktop && npm test` and `cd web && npm test`.
 
 | Folder | Contents |
 |---|---|
 | `app/` | Editor (Vite + React) |
 | `desktop/` | Electron app: runs each project's Astro dev server |
+| `web/` | Web server: the desktop app's main process for a browser tab ([docs/web.md](docs/web.md)) |
 | `preview-template/` | Vite plugin and canvas bridge copied into each project |
 | `mcp/` | MCP server for coding agents |
 | `scripts/` | Bridge and snapshot builds |

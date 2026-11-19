@@ -49,3 +49,5 @@ jobs:
         run: |
           npm run deps --prefix desktop
           npm test --prefix desktop
+      - name: Web server unit tests
+        run: npm test --workspace=web

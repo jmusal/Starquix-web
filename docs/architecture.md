@@ -1,6 +1,6 @@
 # Starquix Architecture
 
-Visual editor for Astro websites. Desktop (Electron) app.
+Visual editor for Astro websites. Desktop (Electron) app, or a local web app (`web/`, see [web.md](web.md)): a Node server stands in for Electron main and gives the editor the same `window.sqDesktop` API over a WebSocket.
 
 ## System Overview
 
