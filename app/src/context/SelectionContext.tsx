@@ -539,6 +539,17 @@ const CLEARED_SELECTION = {
   additionalSelections: [] as MultiSelectionEntry[],
 } as const;
 
+
+/** A message from this page or from one of its own iframes (the canvas, wherever its preview is served: 127.0.0.1 on
+ *  desktop, a public preview port in the web build). Matching on host names let `*localhost*` look-alikes through and
+ *  shut out a canvas on a real host name. */
+export function fromOwnFrameOrSelf(event: MessageEvent): boolean {
+  if (event.origin === window.location.origin) return true;
+  if (!event.source) return false;
+  for (const frame of Array.from(document.querySelectorAll('iframe'))) if (frame.contentWindow === event.source) return true;
+  return false;
+}
+
 export const SelectionProvider: React.FC<SelectionProviderProps> = ({
   children,
 }) => {
@@ -1114,12 +1125,7 @@ export const SelectionProvider: React.FC<SelectionProviderProps> = ({
   // Listen for source location shifts and update selected key if needed
   useEffect(() => {
     const handleSourceLocationShift = (event: MessageEvent) => {
-      const origin = event.origin;
-      if (origin !== window.location.origin &&
-          !origin.includes('localhost') &&
-          !origin.includes('127.0.0.1')) {
-        return;
-      }
+      if (!fromOwnFrameOrSelf(event)) return;
 
       const data = event.data;
       if (!data || data.type !== 'SOURCE_LOCATION_SHIFTED') return;

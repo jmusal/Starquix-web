@@ -65,20 +65,21 @@ export function createSessions({ projects, spawn, emit, graceMs = 30_000, onOpen
     })();
     return entry.stopping;
   }
+  function release(e) {
+    if (e.stopping || e.released) return;
+    for (const c of e.requests.values()) c.abort();
+    e.requests.clear(); e.lease = `released-${e.lease}`; // the departed document's lease is now stale
+    e.released = setTimeout(() => void stop(e.id, e.lease), graceMs);
+  }
   const stopAll = () => Promise.all([...entries.values()].map(e => stop(e.id, e.lease)));
   return { start, stop, get,
     /** The editor document went away (reload/navigation): its leases die with it
      *  (in-flight requests aborted, a fresh unguessable lease is required), but the
      *  instance waits graceMs for the next document to adopt it — a reload does not
      *  reboot Astro. Accepted-but-unmaterialized edits stay in the renderer's durable journal. */
-    async releaseAll() {
-      for (const e of entries.values()) {
-        if (e.stopping || e.released) continue;
-        for (const c of e.requests.values()) c.abort();
-        e.requests.clear(); e.lease = `released-${e.lease}`; // the departed document's lease is now stale
-        e.released = setTimeout(() => void stop(e.id, e.lease), graceMs);
-      }
-    },
+    async releaseAll() { for (const e of entries.values()) release(e); },
+    /** One document's lease only (web/src/server.mjs: a browser tab that went away while other tabs stay). */
+    async release(id, lease) { const e = entries.get(id); if (e && e.lease === lease) release(e); },
     async closeAll() { closing = true; await stopAll(); },
   };
 }

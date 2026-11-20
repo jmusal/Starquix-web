@@ -154,6 +154,19 @@ it('releasing aborts the departed document\'s in-flight requests', async () => {
   expect(inFlight.signal.aborted).toBe(true);
   await sessions.closeAll();
 });
+it('release(id, lease) frees one document\'s project only, and only for its own lease', async () => {
+  const instance = () => ({ ready: Promise.resolve({ url: 'http://127.0.0.1:4567', generation: 1 }), stop: vi.fn(async () => {}), state: () => ({ phase: 'running' }) });
+  const sessions = createSessions({ projects: { seed: async () => '/owned/p' }, spawn: instance, emit() {}, graceMs: 60_000 });
+  await sessions.start('a', 'tab-1'); await sessions.start('b', 'tab-2');
+  await sessions.release('a', 'not-tab-1'); expect(() => sessions.get('a', 'tab-1')).not.toThrow(); // a foreign lease frees nothing
+  const inFlight = new AbortController(); sessions.get('a', 'tab-1').requests.set('r1', inFlight);
+  await sessions.release('a', 'tab-1');
+  expect(inFlight.signal.aborted).toBe(true);
+  expect(() => sessions.get('a', 'tab-1')).toThrow('Stale');
+  expect(() => sessions.get('b', 'tab-2')).not.toThrow(); // the other tab keeps its project
+  await expect(sessions.start('a', 'tab-3')).resolves.toBeDefined(); // adopted by the reloaded page
+  await sessions.closeAll();
+});
 
 function hooked(over = {}) {
   const calls = [];

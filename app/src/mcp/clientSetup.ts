@@ -16,6 +16,13 @@ export function desktopMcp(): DesktopMcp | null {
   return (globalThis as { sqDesktop?: { mcp?: DesktopMcp } }).sqDesktop?.mcp ?? null;
 }
 
+/** The relay's socket for a port: through the host when it offers one (the web build — the relay listens on the
+ *  server's loopback, web/src/relay.mjs), else this machine's loopback (desktop, dev). */
+export function relaySocketUrl(port: number): string {
+  const host = (globalThis as { sqDesktop?: { relayUrl?: (port: number) => string } }).sqDesktop?.relayUrl;
+  return typeof host === 'function' ? host(port) : `ws://127.0.0.1:${port}`;
+}
+
 /** How the agent launches the relay: the desktop app's bundled copy, run on
  *  the app's own runtime (desktop/src/main.mjs mcpCommand — no npm package,
  *  no Node install); on a dev server this checkout's build (vite.config

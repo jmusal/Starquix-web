@@ -6,6 +6,7 @@
 // (protocol.McpErrorCode); never a hang.
 import { CLOSE_REPLACED, decodePairingCode, PROTOCOL_VERSION, type McpErrorCode, type RelayRequest, type TabResponse } from './protocol';
 import type { Catalogue } from './catalogue';
+import { relaySocketUrl } from './clientSetup';
 
 /** waiting = nothing listens on the code's port yet (a tab-issued code before the
  *  agent runs `pair --code`): the normal idle state, not an error. */
@@ -28,6 +29,9 @@ export interface McpSessionOptions {
   projectId: string;
   projectName: string;
   makeSocket: (url: string) => SocketLike;
+  /** The relay's socket URL for a port. Default: the host's (web/client/client.js relays through the Starquix server,
+   *  so a browser on another machine reaches it), else the relay on this machine's loopback (desktop). */
+  relayUrl?: (port: number) => string;
   /** Built per request so selection/breakpoint are fresh and each call gets its own batch guard. */
   getCatalogue: () => Catalogue;
   /** Persist files after a mutating call. */
@@ -93,7 +97,7 @@ export class McpSession {
     this.helloOk = false;
     // A waiting tab redials every few seconds: stay 'waiting' (no amber flicker).
     if (this.state !== 'waiting') this.setStatus('connecting');
-    const ws = this.opts.makeSocket(`ws://127.0.0.1:${this.target.port}`);
+    const ws = this.opts.makeSocket((this.opts.relayUrl ?? relaySocketUrl)(this.target.port));
     this.socket = ws;
     let opened = false;
     ws.onopen = () => {

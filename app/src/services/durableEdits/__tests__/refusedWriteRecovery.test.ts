@@ -5,7 +5,7 @@
 // moved under it; a true conflict is one deterministic issue the user can discard.
 import 'fake-indexeddb/auto';
 import * as Y from 'yjs';
-import { writeFileSync } from 'node:fs';
+import { utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { db } from '@/db';
@@ -30,7 +30,15 @@ const post = '---\ntitle: "Hi"\ndraft: true\n---\nOne.\n\nTwo.\n\nThree.\n';
 let runtime: ReturnType<typeof projectFsRuntime>;
 let outsideWrite: string | null = null, outsideAt = file;
 let doc: Y.Doc;
-const outside = (bytes: string, at = file) => writeFileSync(join(runtime.root, at), bytes);
+// An outside writer landing after the edit's acceptance. "Newer" compares the file mtime with the edit's acceptedAt
+// (commandReceipts acceptedAfter); Linux stamps mtime from a coarse kernel clock that can read a few ms behind Date.now(),
+// so a write right after acceptance could look older and the edit overwrote it (pre-push flake). Pin it clearly after.
+const outside = (bytes: string, at = file) => {
+  const path = join(runtime.root, at);
+  writeFileSync(path, bytes);
+  const later = new Date(Date.now() + 1000);
+  utimesSync(path, later, later);
+};
 beforeEach(async () => {
   // The materializer keeps per-project state for the session: one id per test.
   projectId = `browser_refused_write_recovery_${++sequence}`;

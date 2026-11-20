@@ -8,7 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import React from 'react';
 import { render, act } from '@testing-library/react';
-import { SelectionProvider } from '@/context/SelectionContext';
+import { SelectionProvider, fromOwnFrameOrSelf } from '@/context/SelectionContext';
 import { useSelection } from '@/test/mergedSelectionHook';
 
 // Helper to check if an origin is valid
@@ -303,5 +303,22 @@ describe('Text Selection State', () => {
     expect(selectionState?.textSelection.existingHref).toBe('https://example.com');
     expect(selectionState?.textSelection.existingTarget).toBe('_blank');
     expect(selectionState?.textSelection.linkKey).toBe('a-0');
+  });
+});
+
+describe('fromOwnFrameOrSelf: canvas messages are trusted by their frame, not by a host name', () => {
+  afterEach(() => { document.body.innerHTML = ''; });
+  const message = (origin: string, source: MessageEventSource | null) => new MessageEvent('message', { origin, source, data: {} });
+
+  it('accepts this page and its own iframes on any origin (a public preview port in the web build)', () => {
+    const frame = document.createElement('iframe'); document.body.append(frame);
+    expect(fromOwnFrameOrSelf(message(window.location.origin, null))).toBe(true);
+    expect(fromOwnFrameOrSelf(message('https://starquix.example.com:3100', frame.contentWindow))).toBe(true);
+  });
+  it('refuses another window, including a localhost look-alike host', () => {
+    const stranger = document.createElement('iframe'); // not in this document
+    document.body.append(stranger); const other = stranger.contentWindow; stranger.remove();
+    expect(fromOwnFrameOrSelf(message('https://evil-localhost.com', other))).toBe(false);
+    expect(fromOwnFrameOrSelf(message('http://127.0.0.1.evil.test', null))).toBe(false);
   });
 });

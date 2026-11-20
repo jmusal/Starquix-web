@@ -28,6 +28,20 @@ describe('McpSession', () => {
     expect(h.ws.url).toBe('ws://127.0.0.1:43989'); // parseInt('xxx', 36)
     expect(h.ws.sent[0]).toMatchObject({ type: 'hello', v: 1, token: 'a'.repeat(24), projectId: 'p', projectName: 'P' });
   });
+  it('dials the relay through the host when the host offers it (web build: the relay is on the server)', async () => {
+    const g = globalThis as { sqDesktop?: unknown };
+    const before = g.sqDesktop;
+    g.sqDesktop = { relayUrl: (port: number) => `wss://starquix.example/__sq-web/relay/${port}` };
+    try {
+      const h = harness(); h.s.connect(); await tick();
+      expect(h.ws.url).toBe('wss://starquix.example/__sq-web/relay/43989');
+      expect(h.ws.sent[0]).toMatchObject({ type: 'hello', token: 'a'.repeat(24) }); // the pairing token still authenticates
+    } finally { g.sqDesktop = before; }
+  });
+  it('an explicit relayUrl option wins', async () => {
+    const h = harness({ relayUrl: port => `ws://relay.test:${port}/x` }); h.s.connect(); await tick();
+    expect(h.ws.url).toBe('ws://relay.test:43989/x');
+  });
   it('rejects a malformed code up front', () => {
     const onStatus = vi.fn();
     const h = harness({ code: 'garbage', onStatus });

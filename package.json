@@ -5,12 +5,16 @@
   "private": true,
   "workspaces": [
     "app",
-    "mcp"
+    "mcp",
+    "web"
   ],
   "scripts": {
     "dev": "npm run dev --workspace=app",
     "test": "npm run test --workspace=app",
-    "build:snapshot": "node scripts/build-snapshot.js"
+    "build:snapshot": "node scripts/build-snapshot.js",
+    "web": "npm start --workspace=web",
+    "web:dev": "npm run dev --workspace=web",
+    "web:build": "npm run build --workspace=web"
   },
   "dependencies": {
     "@plausible-analytics/tracker": "^0.4.4"

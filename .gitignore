@@ -65,3 +65,7 @@ fixtures/local-astro-project/src/env.d.ts
 
 # Generated native-size icon review sheet
 /app/icon-review.html
+
+# Web server e2e output
+web/test-results/
+web/playwright-report/
