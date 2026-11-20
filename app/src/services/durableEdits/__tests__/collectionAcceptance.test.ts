@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { webcrypto } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { db } from '@/db';
@@ -96,12 +96,22 @@ it('preserves local ownership when a caller requests generated content config', 
   expect(await db.durableEdits.count()).toBe(0);
 });
 
+// An outside writer landing after the edit's acceptance. "Newer" compares the file mtime with the edit's acceptedAt;
+// Linux stamps mtime from a coarse kernel clock that can read a few ms behind Date.now(), so the write could look older
+// and the field change overwrote it (pre-push flake). Pin its mtime clearly after acceptance.
+function writeOutside(file: string, bytes: string) {
+  const path = join(runtime.root, file);
+  writeFileSync(path, bytes);
+  const later = new Date(Date.now() + 1000);
+  utimesSync(path, later, later);
+}
+
 // Agent multiplayer (owner 2026-11-08, ledger B5a): a newer outside rewrite of
 // the schema leaves the whole field change unapplied — schema and posts stay
 // consistent — and the queue moves on.
 it('keeps a multi-file field change atomic when a newer outside schema edit wins its config', async () => {
   await contentOps.addLocalCollectionField('posts', 'draft', false, 'boolean');
-  writeFileSync(join(runtime.root, config), '// external schema edit\n');
+  writeOutside(config, '// external schema edit\n');
   await flushDurableSourceWrites(projectId);
   expect(runtime.read(post)).toBe(original); expect(runtime.read(second)).toBe(secondSource);
   expect(runtime.read(config)).toBe('// external schema edit\n'); expect(dispatched).toBe(0);
