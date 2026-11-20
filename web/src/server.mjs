@@ -4,13 +4,15 @@
 // behind a local HTTP server. The editor (app/) runs in any browser tab and reaches them through window.sqDesktop, which
 // web/client/client.js provides over one WebSocket instead of Electron IPC.
 //
-// Trust model (desktop: one window, a sandboxed preload): the server listens on loopback by default; a browser needs the
-// access token (printed at start, kept in <data>/access-token) once, which becomes an HttpOnly SameSite=Strict cookie. The
-// socket also requires the editor's own Origin. Anyone holding the token controls this machine's projects and its shell.
+// Trust model (desktop: one window, a sandboxed preload): the server listens on loopback by default, and beyond it only
+// over HTTPS (config.mjs). A browser signs in once with the access token (printed at start, kept in <data>/access-token);
+// the session cookie it gets is required by the editor, every preview port (preview.mjs), the socket and the relay proxy.
+// Anyone holding the token controls this machine's projects and its shell.
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -31,7 +33,11 @@ import { createTerminals, shellSpec } from '../../desktop/src/terminal.mjs';
 import { createWatchers } from '../../desktop/src/watch.mjs';
 import { installCrashLog } from '../../desktop/src/crash-log.mjs';
 import { createKeychain, fileStore, loadKey } from './secrets.mjs';
-import { createHttpHandler, proxyUpgrade } from './http.mjs';
+import { createAuth as createWebAuth } from './auth.mjs';
+import { resolveConfig } from './config.mjs';
+import { createHttpHandler, proxyDevUpgrade } from './http.mjs';
+import { createPreviews } from './preview.mjs';
+import { createRelayProxy, relayPortFrom } from './relay.mjs';
 import { createRpc } from './rpc.mjs';
 import { createSignIn } from './signin.mjs';
 
@@ -40,11 +46,13 @@ const repo = path.resolve(here, '../..');
 const env = process.env;
 const argv = process.argv.slice(2);
 const flag = name => argv.includes(`--${name}`);
-const option = name => { const i = argv.indexOf(`--${name}`); return i >= 0 ? argv[i + 1] : undefined; };
 
-const port = Number(option('port') ?? env.SQ_WEB_PORT ?? 3060);
-const host = option('host') ?? env.SQ_WEB_HOST ?? '127.0.0.1';
-const origin = (env.SQ_WEB_ORIGIN ?? `http://${host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host}:${port}`).replace(/\/$/, '');
+let config;
+try { config = resolveConfig({ argv, env }); } catch (error) {
+  if (error.code !== 'config') throw error;
+  console.error(error.message); process.exit(1);
+}
+const { port, host, origin, tls } = config;
 const dataDir = path.resolve(env.SQ_USER_DATA ?? path.join(os.homedir(), '.starquix-web'));
 const projectsRoot = path.resolve(env.SQ_PROJECTS_ROOT ?? path.join(os.homedir(), 'Starquix'));
 const templateDir = path.resolve(env.SQ_TEMPLATE_DIR ?? path.join(repo, 'preview-template'));
@@ -80,13 +88,14 @@ function accessToken() {
 }
 const token = accessToken();
 
+const auth = createWebAuth({ token, secure: config.secure });
 const projects = createProjects(projectsRoot);
 let rpc = null; // set below; the factories only emit after start
 const emit = (channel, ...args) => rpc?.emit(channel, ...args);
 
 // Coding-agent relay (desktop/src/agents.mjs): the launcher runs THIS Node on the bundled relay script.
-const mcpHost = createMcpHost({ relayHome: env.STARQUIX_MCP_HOME || path.join(os.homedir(), '.starquix-mcp'),
-  execPath: process.execPath, script: mcpScript });
+const relayHome = env.STARQUIX_MCP_HOME || path.join(os.homedir(), '.starquix-mcp');
+const mcpHost = createMcpHost({ relayHome, execPath: process.execPath, script: mcpScript });
 let mcpCommand = null; let shellHook = null;
 if (hasMcp) {
   mcpCommand = `"${mcpHost.launcher}"`;
@@ -108,12 +117,15 @@ const terminals = createTerminals({
   },
   emit,
 });
+// Each open project's canvas on a public port of its own (preview.mjs); the editor only ever sees those URLs.
+const previews = createPreviews({ auth, editorOrigin: origin, publicOrigin: config.previewOrigin, ports: config.previewPorts,
+  bindHost: host, tls });
 const watchers = createWatchers({ read: (id, rels) => projects.read(id, rels), emit });
 const sessions = createSessions({ projects,
   spawn: options => createInstance({ ...options, templateDir, depsDir, spares: true }),
-  emit: state => emit('state', state),
+  emit: state => void previews.publicState(state.id, state, s => emit('state', s)),
   onOpen: id => { terminals.keepOnly(id); watchers.keepOnly(id, projectDirFor(projectsRoot, id)); },
-  onClose: id => { terminals.release(id); watchers.release(id); },
+  onClose: id => { terminals.release(id); watchers.release(id); void previews.close(id); },
 });
 
 // Versions, GitHub and Cloudflare (main.mjs): the sign-ins live in the data folder, encrypted (secrets.mjs).
@@ -132,13 +144,17 @@ const handlers = {
   'mcp-rotate': () => (hasMcp ? mcpHost.rotate() : null),
   exists: ([id]) => projects.exists(id),
   start: async ([id, lease, seed], client) => {
-    const result = sessions.start(id, lease, seed);
+    const started = sessions.start(id, lease, seed);
     client.leases.set(id, lease); // after start validated the lease
-    return result;
+    const result = await started;
+    return { ...result, url: await previews.publicUrl(id, result.url) };
   },
   stop: async ([id, lease], client) => { if (client.leases.get(id) === lease) client.leases.delete(id); return sessions.stop(id, lease); },
   snapshot: async ([id, lease]) => { const owner = sessions.get(id, lease); await owner.ready; return projects.snapshot(id); },
-  status: ([id, lease]) => sessions.get(id, lease).instance?.state() ?? { phase: 'starting' },
+  status: async ([id, lease]) => {
+    const state = sessions.get(id, lease).instance?.state() ?? { phase: 'starting' };
+    return state.url ? { ...state, url: await previews.publicUrl(id, state.url) } : state;
+  },
   git: ([id, lease, op, args]) => {
     sessions.get(id, lease);
     const run = () => runGitOp(git, projectDirFor(projectsRoot, id), op, args);
@@ -179,20 +195,23 @@ const notices = {
 const ipcLog = env.SQ_IPC_LOG ? (name, args, ms) => console.log('[sq-ipc]', JSON.stringify({ at: Date.now(), name,
   route: name === 'fetch' ? `${args[3]} ${String(args[4]).replace(/path=[^&]*&?/, '').replace(/[?&]$/, '')}` : '', ms })) : undefined;
 
-rpc = createRpc({ token, origin, handlers, notices, log: ipcLog,
+rpc = createRpc({ auth, origin, handlers, notices, log: ipcLog,
   onClose: client => {
     // The tab is gone (closed or reloading): its leases die, the instances wait for the next page to adopt them.
     for (const [id, lease] of client.leases) void sessions.release(id, lease);
     if (!rpc.clients.size) signIn.cancelAll();
   } });
 
-const handle = createHttpHandler({ token, origin, secure: origin.startsWith('https:'),
+const relay = createRelayProxy({ auth, origin, relayPort: () => relayPortFrom(relayHome) });
+const handle = createHttpHandler({ auth, origin,
   editor: devEditor ? { devUrl: devEditor } : { dir: editorDir },
   boot: () => ({ mcpCommand, mcpServer: hasMcp ? mcpHost.server : null }) });
-const server = http.createServer(handle);
+const server = tls ? https.createServer({ ...tls }, handle) : http.createServer(handle);
+server.on('clientError', (_error, socket) => socket.destroy());
 server.on('upgrade', (req, socket, head) => {
-  if (rpc.upgrade(req, socket, head)) return;
-  if (devEditor && req.headers.host === new URL(origin).host) return proxyUpgrade(req, socket, head, devEditor); // Vite HMR
+  if (rpc.upgrade(req, socket, head) || relay.upgrade(req, socket, head)) return;
+  // Vite's HMR for the dev editor: signed in, this origin only.
+  if (devEditor && req.headers.host === new URL(origin).host && req.headers.origin === origin && auth.signedIn(req)) return proxyDevUpgrade(req, socket, head, devEditor);
   socket.destroy();
 });
 server.on('error', error => {
@@ -202,9 +221,11 @@ server.on('error', error => {
 });
 server.listen(port, host, () => {
   const link = `${origin}/?token=${token}`;
-  console.log(`\n  Starquix is running.\n\n  Open: ${link}\n\n  Projects: ${projectsRoot}\n  Press Ctrl-C to stop.\n`);
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-    console.warn('  Warning: listening beyond this computer. The canvas still loads from this machine\'s loopback ports, and anyone with the link controls your projects and shell.\n');
+  const previewsAt = `${config.previewOrigin(config.previewPorts.from)} … :${config.previewPorts.to}`;
+  console.log(`\n  Starquix is running.\n\n  Open: ${link}\n  (or sign in at ${origin} with the token in ${path.join(dataDir, 'access-token')})\n\n  Previews: ${previewsAt}\n  Projects: ${projectsRoot}\n  Press Ctrl-C to stop.\n`);
+  if (config.remote) {
+    console.warn(`  Listening on ${host}${tls ? ' over HTTPS' : ' over PLAIN HTTP (--allow-insecure-http)'}: anyone with the token controls your projects and this machine's shell.`);
+    console.warn(`  Browsers on other machines also need ports ${config.previewPorts.from}-${config.previewPorts.to} (the canvas).\n`);
   }
   if (flag('open')) {
     const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
@@ -228,6 +249,7 @@ function shutdown() {
     }
     signIn.cancelAll(); terminals.closeAll(); watchers.closeAll();
     await sessions.closeAll();
+    await previews.closeAll();
     await closeSpare();
     rpc.close(); server.close();
   })().catch(error => console.error('[sq-web shutdown]', error)).finally(() => process.exit(0));

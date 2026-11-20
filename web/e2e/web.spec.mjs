@@ -2,12 +2,13 @@
 // Mirrors desktop/e2e/runtime.spec.mjs's first journey (edit → disk → reload → child crash → server restart) plus the parts
 // that changed transport: the shell, versions (git), the access-token gate and the socket's origin check.
 import { test, expect } from '@playwright/test';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { BAD_PORTS } from '../src/preview.mjs';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const fixture = path.join(root, 'app/e2e/fixtures/release-project');
@@ -17,10 +18,12 @@ const preview = page => page.locator('iframe[title$=" preview"]:visible').first(
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { if (e.code === 'ESRCH') return false; throw e; } };
 
 let nextPort = 3160 + Math.floor(Math.random() * 500);
-async function startServer(temp, port = nextPort++) {
+/** `args`: extra server flags; `origin`: the address browsers use (default http://127.0.0.1:<port>). */
+const takePort = () => { while (BAD_PORTS.has(nextPort)) nextPort++; const port = nextPort; nextPort += 60; return port; }; // +60: preview ports never overlap
+async function startServer(temp, port = takePort(), { args = [], origin = `http://127.0.0.1:${port}` } = {}) {
   const env = { ...process.env, SQ_USER_DATA: path.join(temp, 'data'), SQ_PROJECTS_ROOT: path.join(temp, 'projects'),
     STARQUIX_MCP_HOME: path.join(temp, 'mcp-home'), SQ_WEB_TOKEN: TOKEN, SQ_WEB_PORT: String(port) };
-  const child = spawn(process.execPath, [path.join(root, 'web/src/server.mjs')], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [path.join(root, 'web/src/server.mjs'), ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   const out = [];
   child.stdout.on('data', d => out.push(String(d))); child.stderr.on('data', d => out.push(String(d)));
   const exited = new Promise(r => child.once('exit', r));
@@ -28,7 +31,6 @@ async function startServer(temp, port = nextPort++) {
     if (child.exitCode !== null) throw new Error(`server exited: ${out.join('')}`);
     await delay(100);
   }
-  const origin = `http://127.0.0.1:${port}`;
   return { origin, port, out, child,
     async stop() { if (child.exitCode === null) { child.kill('SIGINT'); await Promise.race([exited, delay(20_000)]); } } };
 }
@@ -159,4 +161,84 @@ test('the shell and versions work through the socket', async ({ page }, info) =>
     await info.attach('server.log', { body: server.out.join(''), contentType: 'text/plain' });
     throw error;
   } finally { await server.stop(); await fs.rm(temp, { recursive: true, force: true, maxRetries: 10 }); }
+});
+
+/** This machine's first non-loopback IPv4 address: a browser on another machine would use one like it. */
+const lanAddress = () => Object.values(os.networkInterfaces()).flat().find(i => i && i.family === 'IPv4' && !i.internal)?.address ?? null;
+const loopback = url => { try { return /^(127\.|localhost$|\[::1\]$)/.test(new URL(url).hostname); } catch { return false; } };
+
+test('from another machine: HTTPS on a network address, sign-in form, canvas and edits — never a loopback URL', async ({ browser }, info) => {
+  const address = lanAddress();
+  test.skip(!address, 'no non-loopback network address on this machine');
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'sq-web-'));
+  // A self-signed certificate for that address, as a user might make one (or use a real one from their CA).
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', `/CN=${address}`,
+    '-addext', `subjectAltName=IP:${address}`, '-keyout', path.join(temp, 'key.pem'), '-out', path.join(temp, 'cert.pem')], { stdio: 'ignore' });
+  const port = takePort();
+  const origin = `https://${address}:${port}`;
+  const server = await startServer(temp, port, { origin,
+    args: ['--host', address, '--tls-cert', path.join(temp, 'cert.pem'), '--tls-key', path.join(temp, 'key.pem')] });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  const loopbackHits = []; const consoleLines = [];
+  page.on('console', m => consoleLines.push(`[${m.type()}] ${m.text()}`)); page.on('pageerror', e => consoleLines.push(`[pageerror] ${e.stack}`));
+  context.on('request', r => { if (loopback(r.url())) loopbackHits.push(r.url()); });
+  page.on('websocket', ws => { if (loopback(ws.url())) loopbackHits.push(ws.url()); });
+  try {
+    // Plain HTTP on that address is not served at all.
+    expect(await fetch(`http://${address}:${port}/`).then(() => 'answered', () => 'refused')).toBe('refused');
+    await test.step('sign in with the form', async () => {
+    // The sign-in form: the token is pasted, never put in a URL.
+    await page.goto(`${origin}/`);
+    await expect(page).toHaveURL(`${origin}/__sq-web/login?next=%2F`);
+    await page.getByLabel('Access token').fill('not-the-token');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.getByRole('alert')).toHaveText('That token is not right.');
+    await page.getByLabel('Access token').fill(TOKEN);
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.getByRole('heading', { name: 'Projects', exact: true })).toBeVisible({ timeout: 60_000 });
+    const cookies = await context.cookies(origin);
+    expect(cookies.find(c => c.name === 'sq_web_session')).toMatchObject({ httpOnly: true, secure: true, sameSite: 'Strict' });
+    expect(cookies.some(c => c.value.includes(TOKEN))).toBe(false);
+    });
+
+    const id = await test.step('import a project', () => importFixture(page, 'Remote fixture'));
+    const heading = preview(page).getByRole('heading', { name: 'Release fixture', exact: true });
+    let canvas;
+    await test.step('the canvas loads from the preview port', async () => {
+    await expect(heading).toBeVisible({ timeout: BOOT });
+    // The canvas comes from this server's preview port on the same address, over HTTPS.
+    canvas = await page.locator('iframe[title$=" preview"]:visible').first().getAttribute('src');
+    expect(new URL(canvas).origin).toBe(`https://${address}:${port + 40}`);
+    // The relay is dialed through this server too (web/src/relay.mjs).
+    expect(await page.evaluate(() => window.sqDesktop.relayUrl(47821))).toBe(`wss://${address}:${port}/__sq-web/relay/47821`);
+    });
+
+    const file = path.join(temp, 'projects', id, 'src/pages/index.astro');
+    await test.step('edit the heading on the canvas', async () => {
+    await select(page, heading);
+    await expect(page.getByTestId('design-bar').getByText('H1', { exact: true })).toBeVisible({ timeout: 15_000 });
+    await page.keyboard.press('Enter');
+    await preview(page).locator('[contenteditable="true"]').fill('Edited from afar');
+    await page.keyboard.press('Escape');
+    await expect.poll(() => fs.readFile(file, 'utf8'), { timeout: 15_000 }).toContain('Edited from afar');
+    });
+    await test.step('live reload through the gateway', async () => {
+    // Live reload over the gateway: a change on disk (an agent in the terminal) reaches the canvas.
+    await fs.writeFile(file, (await fs.readFile(file, 'utf8')).replace('Edited from afar', 'Changed on the server'));
+    await expect(preview(page).getByRole('heading', { name: 'Changed on the server' })).toBeVisible({ timeout: 30_000 });
+    });
+
+    // A signed-out browser gets nothing from the canvas port either.
+    const outsider = await browser.newContext({ ignoreHTTPSErrors: true });
+    const res = await outsider.request.get(canvas);
+    expect(res.status()).toBe(401);
+    await outsider.close();
+    expect(loopbackHits).toEqual([]);
+  } catch (error) {
+    await info.attach('server.log', { body: server.out.join(''), contentType: 'text/plain' });
+    await info.attach('console.log', { body: consoleLines.join('\n'), contentType: 'text/plain' });
+    await page.screenshot({ path: info.outputPath('failure.png') }).catch(() => {});
+    throw error;
+  } finally { await context.close(); await server.stop(); await fs.rm(temp, { recursive: true, force: true, maxRetries: 10 }); }
 });

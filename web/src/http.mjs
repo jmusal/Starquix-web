@@ -1,16 +1,16 @@
-// The web server's HTTP side: access-token login, the editor (a production build from disk, or a proxied Vite dev
-// server), and the /__sq-web/client.js shim. Every editor page gets the shim injected before its own scripts.
+// The web server's HTTP side: sign-in, the editor (a production build from disk, or a proxied Vite dev server), and the
+// /__sq-web/client.js shim. Every editor page gets the shim injected before its own scripts.
 import fs from 'node:fs';
 import http from 'node:http';
-import net from 'node:net';
 import path from 'node:path';
-import { timingSafeEqual } from 'node:crypto';
 import { EDITOR_CSP, editorFile } from '../../desktop/src/editor.mjs';
+import { tunnel } from './tunnel.mjs';
 
-export const COOKIE = 'sq_web_auth';
 export const CLIENT_PATH = '/__sq-web/client.js';
 export const SOCKET_PATH = '/__sq-web/socket';
 export const LOGIN_PATH = '/__sq-web/login';
+export const LOGOUT_PATH = '/__sq-web/logout';
+export const RELAY_PREFIX = '/__sq-web/relay/';
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -22,22 +22,8 @@ const TYPES = {
 };
 export const contentType = file => TYPES[path.extname(file).toLowerCase()] ?? 'application/octet-stream';
 
-export function parseCookies(header = '') {
-  const out = {};
-  for (const part of header.split(';')) {
-    const i = part.indexOf('='); if (i < 0) continue;
-    const key = part.slice(0, i).trim(); if (!key) continue;
-    try { out[key] = decodeURIComponent(part.slice(i + 1).trim()); } catch { /* malformed: ignored */ }
-  }
-  return out;
-}
-
-export function tokenMatches(token, value) {
-  if (typeof value !== 'string' || value.length !== token.length) return false;
-  return timingSafeEqual(Buffer.from(value), Buffer.from(token));
-}
-
-export const authorized = (req, token) => tokenMatches(token, parseCookies(req.headers.cookie)[COOKIE]);
+/** The editor's own pages: only its build's scripts (desktop's CSP), and never framed by another site. */
+export const PAGE_CSP = `${EDITOR_CSP}; frame-ancestors 'self'`;
 
 /** The editor's index.html with the shim first in <head>: window.sqDesktop exists before the editor's module runs. */
 export function injectClient(html) {
@@ -52,20 +38,81 @@ export function clientScript(boot) {
   return `(function (BOOT) {\n'use strict';\n${strip('wire.js')}\n${strip('client.js')}\n})(${JSON.stringify(boot).replace(/</g, '\\u003c')});\n`;
 }
 
-const SIGNED_OUT = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Starquix</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f7f7;color:#111}
-main{max-width:420px;padding:24px}code{background:#e9e9e9;padding:1px 5px;border-radius:4px}
-@media (prefers-color-scheme:dark){body{background:#151515;color:#eee}code{background:#2a2a2a}}</style>
-<main><h1 style="font-size:18px">Starquix</h1><p>Open the link the Starquix server printed in its terminal (it ends with <code>?token=…</code>).</p></main>`;
+/** A same-origin path to return to after sign-in; anything else (another site, a protocol-relative URL) is "/". */
+export function safeNext(value) {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\') || value.length > 2048) return '/';
+  if (value.startsWith('/__sq-web/')) return '/';
+  return value;
+}
+
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const SIGN_IN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/** The sign-in page: paste the access token (it never has to appear in a URL), or open the printed link. */
+export function signInPage({ next = '/', error = '' } = {}) {
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in · Starquix</title>
+<style>
+:root{color-scheme:light dark;--bg:#f7f7f7;--card:#fff;--fg:#111;--muted:#666;--line:#d4d4d4;--accent:#111;--accent-fg:#fff;--err:#b91c1c}
+@media (prefers-color-scheme:dark){:root{--bg:#151515;--card:#1e1e1e;--fg:#eee;--muted:#a3a3a3;--line:#3a3a3a;--accent:#eee;--accent-fg:#111;--err:#f87171}}
+*{box-sizing:border-box}body{font:15px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);padding:16px}
+form{width:min(380px,100%);background:var(--card);border:1px solid var(--line);border-radius:12px;padding:24px;display:grid;gap:12px}
+h1{font-size:18px;margin:0}p{margin:0;color:var(--muted);font-size:14px}label{font-size:13px;font-weight:500}
+input{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;background:transparent;color:inherit}
+button{padding:9px 12px;border:0;border-radius:8px;background:var(--accent);color:var(--accent-fg);font:inherit;font-weight:500;cursor:pointer}
+.err{color:var(--err);font-size:14px}code{font-size:13px}
+</style>
+<form method="post" action="${LOGIN_PATH}">
+<h1>Sign in to Starquix</h1>
+<p>Paste the access token the Starquix server printed when it started (also in <code>~/.starquix-web/access-token</code> on that machine).</p>
+<label for="token">Access token</label>
+<input id="token" name="token" type="password" autocomplete="current-password" autofocus required>
+<input type="hidden" name="next" value="${escapeHtml(next)}">
+${error ? `<div class="err" role="alert">${escapeHtml(error)}</div>` : ''}
+<button type="submit">Sign in</button>
+</form></html>`;
+}
+
+/** A form post from this origin's own pages (login CSRF, sign-out). Browsers send Origin on a same-origin POST, but
+ *  `null` under some referrer policies; their Sec-Fetch-Site says the same thing and no page can forge it. */
+export function sameOriginPost(req, origin) {
+  if (req.headers.origin === origin) return true;
+  const unusable = req.headers.origin === undefined || req.headers.origin === 'null';
+  return unusable && req.headers['sec-fetch-site'] === 'same-origin';
+}
+
+async function readForm(req, limit = 4096) {
+  let size = 0; const chunks = [];
+  for await (const chunk of req) { size += chunk.length; if (size > limit) throw Object.assign(new Error('Too large'), { status: 413 }); chunks.push(chunk); }
+  return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+}
 
 /**
- * The request handler for everything but the WebSocket.
- * `editor`: { dir } (a production build) or { devUrl } (a Vite dev server to proxy, HMR included — see `upgrade`).
+ * The request handler for everything but the WebSockets.
+ * `editor`: { dir } (a production build) or { devUrl } (a Vite dev server to proxy; its HMR is `proxyDevUpgrade`).
  */
-export function createHttpHandler({ token, origin, editor, boot, secure = false }) {
+export function createHttpHandler({ auth, origin, editor, boot }) {
   const canonical = new URL(origin);
-  const cookie = `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}; Max-Age=31536000`;
+  const base = auth.secure ? { 'strict-transport-security': 'max-age=31536000' } : {};
   let shim = null; // built once per process (dev: rebuilt each time, the shim's files may be edited)
+
+  function page(res, status, html, extra = {}) {
+    res.writeHead(status, { ...base, 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+      'content-security-policy': SIGN_IN_CSP, 'referrer-policy': 'same-origin', 'x-content-type-options': 'nosniff', ...extra }).end(html);
+  }
+  const signedInRedirect = (res, next) => res.writeHead(303, { ...base, 'set-cookie': auth.signInCookie, location: safeNext(next),
+    'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }).end();
+
+  async function signIn(req, res, url) {
+    if (req.method === 'GET') { page(res, 200, signInPage({ next: safeNext(url.searchParams.get('next')) })); return; }
+    if (req.method !== 'POST') { res.writeHead(405, { allow: 'GET, POST' }).end(); return; }
+    // A form on another site cannot sign this browser in (login CSRF): the form must come from this origin.
+    if (!sameOriginPost(req, origin)) { page(res, 403, signInPage({ error: 'Sign in from this page.' })); return; }
+    if (auth.limiter.blocked()) { page(res, 429, signInPage({ error: 'Too many failed attempts. Wait a minute and try again.' }), { 'retry-after': String(auth.limiter.retryAfter()) }); return; }
+    const form = await readForm(req);
+    const next = safeNext(form.get('next'));
+    if (!auth.isToken(form.get('token') ?? '')) { auth.limiter.fail(); page(res, 401, signInPage({ next, error: 'That token is not right.' })); return; }
+    signedInRedirect(res, next);
+  }
 
   return async function handle(req, res) {
     try {
@@ -74,33 +121,48 @@ export function createHttpHandler({ token, origin, editor, boot, secure = false 
       if (req.headers.host !== canonical.host) {
         res.writeHead(307, { location: new URL(url.pathname + url.search, origin).href }).end(); return;
       }
-      // The printed link (`?token=<ours>`) signs this browser in. Any other `token` query (Vite's own) is just a query.
+      // The printed link (`?token=<ours>`) signs this browser in, then the address bar drops it. Any other `token`
+      // query (Vite's own) is just a query.
       const given = url.searchParams.get('token');
-      if (given !== null && tokenMatches(token, given)) {
-        url.searchParams.delete('token');
-        const next = url.pathname === LOGIN_PATH ? '/' : url.pathname + (url.search || '');
-        res.writeHead(303, { 'set-cookie': cookie, location: next, 'cache-control': 'no-store' }).end(); return;
+      if (given !== null && req.method === 'GET') {
+        if (auth.isToken(given) && !auth.limiter.blocked()) {
+          url.searchParams.delete('token');
+          signedInRedirect(res, url.pathname === LOGIN_PATH ? '/' : url.pathname + url.search); return;
+        }
+        if (!auth.signedIn(req)) auth.limiter.fail();
       }
-      if (url.pathname === LOGIN_PATH || !authorized(req, token)) { res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(SIGNED_OUT); return; }
+      if (url.pathname === LOGIN_PATH) { await signIn(req, res, url); return; }
+      if (url.pathname === LOGOUT_PATH) {
+        if (req.method !== 'POST' || !sameOriginPost(req, origin)) { res.writeHead(405, { allow: 'POST' }).end(); return; }
+        res.writeHead(303, { ...base, 'set-cookie': auth.signOutCookie, location: LOGIN_PATH, 'cache-control': 'no-store' }).end(); return;
+      }
+      if (!auth.signedIn(req)) {
+        // Pages go to the sign-in form; anything else (a script, an asset) is a plain refusal.
+        if (req.method === 'GET' && (req.headers.accept ?? '').includes('text/html')) {
+          res.writeHead(303, { location: `${LOGIN_PATH}?next=${encodeURIComponent(url.pathname + url.search)}`, 'cache-control': 'no-store' }).end();
+        } else res.writeHead(401, { 'cache-control': 'no-store' }).end();
+        return;
+      }
       if (url.pathname === CLIENT_PATH) {
         if (!shim || editor.devUrl) shim = clientScript(boot());
-        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' }).end(shim); return;
+        res.writeHead(200, { ...base, 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }).end(shim); return;
       }
       if (url.pathname.startsWith('/__sq-web/')) { res.writeHead(404).end(); return; }
       if (editor.devUrl) return proxyEditor(req, res, editor.devUrl);
-      return serveEditor(req, res, editor.dir, url.pathname);
+      return serveEditor(req, res, editor.dir, url.pathname, base);
     } catch (error) {
+      if (error.status) { if (!res.headersSent) res.writeHead(error.status); res.end(); return; }
       console.error('[sq-web http]', error);
       if (!res.headersSent) res.writeHead(500); res.end();
     }
   };
 }
 
-async function serveEditor(req, res, dir, pathname) {
+async function serveEditor(req, res, dir, pathname, base) {
   if (!['GET', 'HEAD'].includes(req.method)) { res.writeHead(404).end(); return; } // as the packaged editor answers it
   const file = await editorFile(dir, pathname);
   if (!file) { res.writeHead(404).end('Not found'); return; }
-  const headers = { 'content-type': contentType(file), 'content-security-policy': EDITOR_CSP, 'x-content-type-options': 'nosniff' };
+  const headers = { ...base, 'content-type': contentType(file), 'content-security-policy': PAGE_CSP, 'x-content-type-options': 'nosniff' };
   if (file.endsWith('.html')) {
     const html = injectClient(await fs.promises.readFile(file, 'utf8'));
     res.writeHead(200, { ...headers, 'cache-control': 'no-cache' }).end(req.method === 'HEAD' ? undefined : html); return;
@@ -117,7 +179,7 @@ async function serveEditor(req, res, dir, pathname) {
 function proxyEditor(req, res, devUrl) {
   const target = new URL(devUrl);
   const headers = { ...req.headers, host: target.host };
-  delete headers.cookie; // our auth cookie is ours, never the dev server's
+  delete headers.cookie; // our session cookie is ours, never the dev server's
   delete headers['accept-encoding']; // HTML gets rewritten: plain bytes
   const upstream = http.request({ hostname: target.hostname, port: target.port, method: req.method, path: req.url, headers }, up => {
     const type = up.headers['content-type'] ?? '';
@@ -136,19 +198,9 @@ function proxyEditor(req, res, devUrl) {
   req.pipe(upstream);
 }
 
-/** Development: Vite's HMR socket, piped through unchanged. */
-export function proxyUpgrade(req, socket, head, devUrl) {
+/** Development: Vite's HMR socket for the editor itself. */
+export function proxyDevUpgrade(req, socket, head, devUrl) {
   const target = new URL(devUrl);
-  const upstream = net.connect(Number(target.port), target.hostname, () => {
-    const lines = [`${req.method} ${req.url} HTTP/1.1`];
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      const [key, value] = [req.rawHeaders[i], req.rawHeaders[i + 1]];
-      if (/^cookie$/i.test(key)) continue;
-      lines.push(`${key}: ${/^host$/i.test(key) ? target.host : value}`);
-    }
-    upstream.write(lines.join('\r\n') + '\r\n\r\n'); if (head?.length) upstream.write(head);
-    upstream.pipe(socket); socket.pipe(upstream);
-  });
-  const end = () => { upstream.destroy(); socket.destroy(); };
-  upstream.on('error', end); socket.on('error', end);
+  tunnel(req, socket, head, { port: Number(target.port), host: target.hostname,
+    rewrite: (name, value) => (name === 'cookie' ? undefined : name === 'host' ? target.host : value) });
 }

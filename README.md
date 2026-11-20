@@ -58,7 +58,7 @@ Publish to Cloudflare or GitHub Pages, to Netlify or Vercel through your GitHub 
 
 ## Run in the browser
 
-Starquix also runs as a local web app: a Node server replaces the desktop app, and the editor opens in any browser. It needs Node.js 22+ and works on macOS and Linux.
+Starquix also runs as a web app: a Node server replaces the desktop app, and the editor opens in any browser, on the same computer or on another one over HTTPS. It needs Node.js 22+ and works on macOS and Linux.
 
 ```bash
 npm ci
@@ -67,7 +67,7 @@ npm run web:build
 npm run web          # open the printed link (it ends with ?token=…)
 ```
 
-How it works, options, security and limits: [docs/web.md](docs/web.md).
+Use from another computer (HTTPS), options, security and limits: [docs/web.md](docs/web.md).
 
 ## Development
 

@@ -83,6 +83,8 @@ window.sqDesktop = {
   mcpCommand: BOOT.mcpCommand ?? null,
   mcpServer: BOOT.mcpServer ?? null,
   mcp: { code: () => call('mcp-code'), rotate: () => call('mcp-rotate'), onCode: stream('mcp-code') },
+  /** The relay's socket through this server (web/src/relay.mjs): the relay listens on the SERVER's loopback. */
+  relayUrl: port => { const u = new URL(`/__sq-web/relay/${port}`, location.href); u.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'; return u.href; },
   exists: id => call('exists', id),
   start: (id, lease, seed) => call('start', id, lease, seed),
   stop: (id, lease) => call('stop', id, lease),

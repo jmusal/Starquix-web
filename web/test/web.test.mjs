@@ -6,7 +6,8 @@ import path from 'node:path';
 import { WebSocket } from 'ws';
 import { decodeFrame, encodeFrame } from '../client/wire.js';
 import { createKeychain, loadKey } from '../src/secrets.mjs';
-import { clientScript, createHttpHandler, injectClient, parseCookies, tokenMatches } from '../src/http.mjs';
+import { clientScript, createHttpHandler, injectClient, safeNext, signInPage } from '../src/http.mjs';
+import { COOKIE, createAuth, createLimiter, parseCookies, sameSecret, withoutSession } from '../src/auth.mjs';
 import { createRpc } from '../src/rpc.mjs';
 import { createSignIn } from '../src/signin.mjs';
 import { codeFromRedirect } from '../../desktop/src/cloudflare.mjs';
@@ -41,9 +42,10 @@ it('sign-ins are encrypted at rest under a key created once', () => {
   expect(() => createKeychain(loadKey(path.join(dir, 'other.key'))).decrypt(chain.encrypt('x'))).toThrow(); // another key
 });
 
-it('cookies, token comparison and the shim tag', () => {
-  expect(parseCookies('a=1; sq_web_auth=x%20y; bad; =z')).toEqual({ a: '1', sq_web_auth: 'x y' });
-  expect(tokenMatches(TOKEN, TOKEN)).toBe(true); expect(tokenMatches(TOKEN, TOKEN.slice(1))).toBe(false); expect(tokenMatches(TOKEN, undefined)).toBe(false);
+it('cookies, secret comparison and the shim tag', () => {
+  expect(parseCookies('a=1; sq_web_session=x%20y; bad; =z')).toEqual({ a: '1', sq_web_session: 'x y' });
+  expect(sameSecret(TOKEN, TOKEN)).toBe(true); expect(sameSecret(TOKEN, TOKEN.slice(1))).toBe(false); expect(sameSecret(TOKEN, undefined)).toBe(false);
+  expect(withoutSession(`a=1; ${COOKIE}=s; b=2`)).toBe('a=1; b=2'); expect(withoutSession(`${COOKIE}=s`)).toBeUndefined();
   expect(injectClient('<html><head lang="x"><title>t</title></head>')).toBe('<html><head lang="x">\n    <script src="/__sq-web/client.js"></script><title>t</title></head>');
   const script = clientScript({ mcpCommand: '</script><script>alert(1)</script>', mcpServer: null });
   expect(script).not.toContain('</script>'); expect(script).not.toMatch(/^export /m);
@@ -70,35 +72,98 @@ async function listen(handler, upgrade) {
   return server.address().port;
 }
 
-it('the HTTP gate: a token link signs in once; nothing else is served signed out', async () => {
+it('the session cookie is derived from the token, never the token itself; a new token signs every browser out', () => {
+  const auth = createAuth({ token: TOKEN, secure: true });
+  expect(auth.signInCookie).not.toContain(TOKEN);
+  expect(auth.signInCookie).toMatch(/HttpOnly/); expect(auth.signInCookie).toMatch(/SameSite=Strict/); expect(auth.signInCookie).toMatch(/Secure/);
+  const cookie = auth.signInCookie.split(';')[0];
+  expect(auth.signedIn({ headers: { cookie } })).toBe(true);
+  expect(auth.signedIn({ headers: { cookie: `${COOKIE}=${TOKEN}` } })).toBe(false); // the raw token is not a session
+  expect(createAuth({ token: TOKEN.replace('u', 'v') }).signedIn({ headers: { cookie } })).toBe(false);
+  expect(() => createAuth({ token: 'short' })).toThrow('at least 32');
+});
+
+it('failed sign-ins are limited for the whole server, and the limit lifts after its window', () => {
+  let t = 0; const limiter = createLimiter({ max: 3, windowMs: 1000, now: () => t });
+  for (let i = 0; i < 3; i++) { expect(limiter.blocked()).toBe(false); limiter.fail(); }
+  expect(limiter.blocked()).toBe(true); expect(limiter.retryAfter()).toBe(1);
+  t = 1000; expect(limiter.blocked()).toBe(false);
+});
+
+it('a sign-in only ever returns to a path on this origin', () => {
+  expect(safeNext('/editor/p?x=1')).toBe('/editor/p?x=1');
+  for (const evil of ['//evil.test/x', '/\\evil.test', 'https://evil.test', 'javascript:alert(1)', '/__sq-web/logout', undefined]) expect(safeNext(evil)).toBe('/');
+  expect(signInPage({ next: '"><script>alert(1)</script>' })).not.toContain('<script>alert');
+});
+
+async function editorServer({ secure = false } = {}) {
   const dir = tempDir(); fs.writeFileSync(path.join(dir, 'index.html'), '<html><head></head><body>editor</body></html>');
   fs.mkdirSync(path.join(dir, 'assets')); fs.writeFileSync(path.join(dir, 'assets/a.js'), 'x');
-  let origin; const port = await listen((req, res) => handle(req, res));
-  origin = `http://127.0.0.1:${port}`;
-  const handle = createHttpHandler({ token: TOKEN, origin, editor: { dir }, boot: () => ({ mcpCommand: null, mcpServer: null }) });
+  let handle; const port = await listen((req, res) => handle(req, res));
+  const origin = `http://127.0.0.1:${port}`;
+  const auth = createAuth({ token: TOKEN, secure, limiter: createLimiter({ max: 3 }) });
+  handle = createHttpHandler({ auth, origin, editor: { dir }, boot: () => ({ mcpCommand: null, mcpServer: null }) });
+  return { origin, auth };
+}
+const post = (url, form, headers = {}) => fetch(url, { method: 'POST', redirect: 'manual',
+  headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(form).toString() });
+
+it('the HTTP gate: the token link or the sign-in form signs in once; nothing else is served signed out', async () => {
+  const { origin } = await editorServer();
   expect((await fetch(`${origin}/assets/a.js`)).status).toBe(401);
+  const page = await fetch(`${origin}/editor/p`, { headers: { accept: 'text/html' }, redirect: 'manual' });
+  expect(page.status).toBe(303); expect(page.headers.get('location')).toBe('/__sq-web/login?next=%2Feditor%2Fp');
+  const form = await fetch(`${origin}/__sq-web/login?next=%2Feditor%2Fp`);
+  expect(await form.text()).toContain('name="token"'); expect(form.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+
   const login = await fetch(`${origin}/editor/p?token=${TOKEN}&x=1`, { redirect: 'manual' });
   expect(login.status).toBe(303); expect(login.headers.get('location')).toBe('/editor/p?x=1');
-  const cookie = login.headers.get('set-cookie'); expect(cookie).toMatch(/HttpOnly/); expect(cookie).toMatch(/SameSite=Strict/);
-  const headers = { cookie: cookie.split(';')[0] };
-  const page = await fetch(`${origin}/editor/p`, { headers }); // a SPA route: index.html, with the shim and the CSP
-  expect(await page.text()).toContain('<script src="/__sq-web/client.js"></script>');
-  expect(page.headers.get('content-security-policy')).toContain("script-src 'self'");
+  const headers = { cookie: login.headers.get('set-cookie').split(';')[0] };
+  const editor = await fetch(`${origin}/editor/p`, { headers }); // a SPA route: index.html, with the shim and the CSP
+  expect(await editor.text()).toContain('<script src="/__sq-web/client.js"></script>');
+  expect(editor.headers.get('content-security-policy')).toContain("script-src 'self'");
+  expect(editor.headers.get('content-security-policy')).toContain("frame-ancestors 'self'");
   const asset = await fetch(`${origin}/assets/a.js`, { headers });
   expect(asset.headers.get('content-type')).toMatch(/javascript/); expect(asset.headers.get('cache-control')).toMatch(/immutable/);
   expect((await fetch(`${origin}/__sq-web/client.js`, { headers })).status).toBe(200);
   // An encoded escape stays inside the build folder (an extensionless miss is the SPA's index.html, never the file).
   for (const evil of ['/%2e%2e/%2e%2e/etc/passwd', '/..%2f..%2fetc%2fpasswd', '/assets/..%2f..%2f..%2fetc%2fhosts.txt']) {
-    const res = await fetch(`${origin}${evil}`, { headers });
-    expect(await res.text()).not.toMatch(/root:|localhost/);
+    expect(await (await fetch(`${origin}${evil}`, { headers })).text()).not.toMatch(/root:|localhost/);
   }
+  // Sign out: the cookie is cleared, only from this origin.
+  expect((await post(`${origin}/__sq-web/logout`, {}, { ...headers, origin: 'https://evil.test' })).status).toBe(405);
+  const out = await post(`${origin}/__sq-web/logout`, {}, { ...headers, origin });
+  expect(out.status).toBe(303); expect(out.headers.get('set-cookie')).toMatch(/Max-Age=0/);
+});
+
+it('the sign-in form: right token signs in, wrong ones are counted, another site cannot post it', async () => {
+  const { origin } = await editorServer();
+  expect((await post(`${origin}/__sq-web/login`, { token: TOKEN }, { origin: 'https://evil.test' })).status).toBe(403); // login CSRF
+  expect((await post(`${origin}/__sq-web/login`, { token: TOKEN }, { origin: 'null', 'sec-fetch-site': 'cross-site' })).status).toBe(403);
+  expect((await post(`${origin}/__sq-web/login`, { token: TOKEN })).status).toBe(403); // no origin at all, nothing to vouch for it
+  // A real browser's own form: Origin can be "null" (referrer policy); Sec-Fetch-Site still says same-origin.
+  expect((await post(`${origin}/__sq-web/login`, { token: TOKEN }, { origin: 'null', 'sec-fetch-site': 'same-origin' })).status).toBe(303);
+  const good = await post(`${origin}/__sq-web/login`, { token: TOKEN, next: '/editor/p' }, { origin });
+  expect(good.status).toBe(303); expect(good.headers.get('location')).toBe('/editor/p'); expect(good.headers.get('set-cookie')).toMatch(/sq_web_session=/);
+  expect((await post(`${origin}/__sq-web/login`, { token: TOKEN, next: '//evil.test' }, { origin })).headers.get('location')).toBe('/');
+  for (let i = 0; i < 3; i++) expect((await post(`${origin}/__sq-web/login`, { token: 'wrong' }, { origin })).status).toBe(401);
+  const limited = await post(`${origin}/__sq-web/login`, { token: TOKEN }, { origin }); // even the right token waits now
+  expect(limited.status).toBe(429); expect(limited.headers.get('retry-after')).toBeTruthy();
+  expect((await fetch(`${origin}/?token=${TOKEN}`, { redirect: 'manual' })).status).not.toBe(303); // the link waits too
+});
+
+it('HTTPS deployments get HSTS', async () => {
+  const { origin } = await editorServer({ secure: true });
+  expect((await fetch(`${origin}/__sq-web/login`)).headers.get('strict-transport-security')).toMatch(/max-age=/);
 });
 
 it('the socket: calls answer with bytes and encoded errors, events reach every tab, a foreign origin is refused', async () => {
   let rpc; const closed = vi.fn();
   const port = await listen((_q, s) => s.end(), (req, socket, head) => { if (!rpc.upgrade(req, socket, head)) socket.destroy(); });
   const origin = `http://127.0.0.1:${port}`;
-  rpc = createRpc({ token: TOKEN, origin, onClose: closed, handlers: {
+  const auth = createAuth({ token: TOKEN });
+  const session = auth.signInCookie.split(';')[0];
+  rpc = createRpc({ auth, origin, onClose: closed, handlers: {
     echo: ([bytes]) => ({ got: bytes, size: bytes.byteLength }),
     fail: () => { throw Object.assign(new Error('sq-git:{"code":"nothing"}'), { code: 'nothing' }); },
   } });
@@ -107,9 +172,10 @@ it('the socket: calls answer with bytes and encoded errors, events reach every t
     const ws = new WebSocket(`ws://127.0.0.1:${port}/__sq-web/socket`, { headers });
     ws.binaryType = 'arraybuffer'; ws.once('open', () => resolve(ws)); ws.once('error', reject); ws.once('unexpected-response', (_q, r) => reject(new Error(String(r.statusCode))));
   });
-  await expect(open({ origin, cookie: 'sq_web_auth=wrong' })).rejects.toThrow('403');
-  await expect(open({ origin: 'http://evil.test', cookie: `sq_web_auth=${TOKEN}` })).rejects.toThrow('403');
-  const ws = await open({ origin, cookie: `sq_web_auth=${TOKEN}` });
+  await expect(open({ origin, cookie: `${COOKIE}=wrong` })).rejects.toThrow('403');
+  await expect(open({ origin, cookie: `${COOKIE}=${TOKEN}` })).rejects.toThrow('403'); // the token is not a session
+  await expect(open({ origin: 'http://evil.test', cookie: session })).rejects.toThrow('403');
+  const ws = await open({ origin, cookie: session });
   const replies = [];
   ws.on('message', data => replies.push(decodeFrame(data)));
   ws.send(encodeFrame({ t: 'call', id: 1, name: 'echo', args: [new Uint8Array([5, 6]).buffer] }));

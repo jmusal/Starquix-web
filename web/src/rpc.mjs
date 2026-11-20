@@ -3,7 +3,8 @@
 // of main.mjs's did-start-navigation → sessions.releaseAll(): the instance waits for the reloaded page to adopt it.
 import { WebSocketServer } from 'ws';
 import { decodeFrame, encodeFrame } from '../client/wire.js';
-import { SOCKET_PATH, authorized } from './http.mjs';
+import { SOCKET_PATH } from './http.mjs';
+import { refuse } from './tunnel.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024; // a 25 MB fetch body / project seed, with room
 
@@ -16,13 +17,13 @@ export function encodeError(error) {
  * `handlers`: name → (args, client) => value; `notices`: name → (args, client) => void (fire-and-forget sends).
  * `onClose(client)` runs when a tab's socket closes.
  */
-export function createRpc({ token, origin, handlers, notices = {}, onClose = () => {}, log = () => {} }) {
+export function createRpc({ auth, origin, handlers, notices = {}, onClose = () => {}, log = () => {} }) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME });
   const clients = new Set();
 
   function accepts(req) {
     // The editor page only: same origin (a cross-site page cannot open it with our cookie) and signed in.
-    return req.headers.origin === origin && authorized(req, token);
+    return req.headers.origin === origin && auth.signedIn(req);
   }
 
   wss.on('connection', socket => {
@@ -60,7 +61,7 @@ export function createRpc({ token, origin, handlers, notices = {}, onClose = () 
     /** The upgrade request for SOCKET_PATH; false = not ours (the caller may proxy it). */
     upgrade(req, socket, head) {
       if (new URL(req.url, origin).pathname !== SOCKET_PATH) return false;
-      if (!accepts(req)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return true; }
+      if (!accepts(req)) { refuse(socket, 403, 'Forbidden'); return true; }
       wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
       return true;
     },
